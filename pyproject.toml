@@ -47,7 +47,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
 ]
-pythonpath = ["src", "scripts"]
+pythonpath = ["src", "tests"]
 
 [tool.ruff]
 line-length = 100
