@@ -118,15 +118,25 @@ def cmd_auth(args: argparse.Namespace) -> int:
         print(f"Auth failed: {exc}", file=sys.stderr)
         return EXIT_AUTH
 
-    token_dict = oauth.exchange_code(
-        http_client,
-        auth_host=settings.auth_host,
-        client_id=settings.truelayer_client_id,
-        client_secret=settings.truelayer_client_secret,
-        code=code,
-        redirect_uri=settings.truelayer_redirect_uri,
-        verifier=verifier,
-    )
+    try:
+        token_dict = oauth.exchange_code(
+            http_client,
+            auth_host=settings.auth_host,
+            client_id=settings.truelayer_client_id,
+            client_secret=settings.truelayer_client_secret,
+            code=code,
+            redirect_uri=settings.truelayer_redirect_uri,
+            verifier=verifier,
+        )
+    except AuthError as exc:
+        print(f"Token exchange failed: {exc}", file=sys.stderr)
+        print(
+            "Common causes: client_secret mismatch, redirect_uri not whitelisted "
+            "in the TrueLayer console for this app, or sandbox credentials used "
+            "against the live endpoint.",
+            file=sys.stderr,
+        )
+        return EXIT_AUTH
 
     token_repo.put(
         PROVIDER_TRUELAYER,
