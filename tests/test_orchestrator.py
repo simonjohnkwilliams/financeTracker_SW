@@ -435,6 +435,34 @@ class TestThirdRunRecovery:
         assert all_repos["transaction_repo"].count() == count_after_first
 
 
+class TestRunCleanup:
+    def test_run_one_closes_sync_run_on_unexpected_exception(
+        self, all_repos: dict[str, Any], fixture_data: dict[str, Any]
+    ) -> None:
+        """An unexpected exception (e.g. TypeError) must not leave a 'running' sync_run."""
+
+        class BrokenClient(MockTrueLayerClient):
+            def fetch_accounts(self) -> list[dict[str, Any]]:
+                raise RuntimeError("simulated unexpected crash")
+
+        client = BrokenClient(
+            accounts=fixture_data["accounts"],
+            txns_by_account=fixture_data["transactions_by_account"],
+        )
+        orch = _make_orchestrator(all_repos, client)
+        _seed_fresh_token(all_repos["token_repo"])
+
+        with pytest.raises(RuntimeError):
+            orch.run_one()
+
+        row = all_repos["sync_run_repo"].latest()
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["finished_at"] is not None
+        assert row["error_summary"] is not None
+        assert "RuntimeError" in row["error_summary"]
+
+
 class TestStructuredLogging:
     def test_run_one_emits_sync_start_log(
         self, orchestrator: SyncOrchestrator

@@ -138,6 +138,19 @@ class SyncOrchestrator:
                 error_summary="Authentication failed — token may have been revoked",
             )
             raise
+        except Exception as exc:
+            log.exception("sync.crashed", run_id=run_id, error_type=type(exc).__name__)
+            self._sync_run_repo.close_run(
+                run_id,
+                status="failed",
+                finished_at=datetime.now(UTC).isoformat(),
+                accounts_attempted=0,
+                accounts_succeeded=0,
+                transactions_inserted=0,
+                transactions_skipped_duplicate=0,
+                error_summary=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
         log.info(
             "sync.complete",

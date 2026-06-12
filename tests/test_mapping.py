@@ -145,6 +145,24 @@ class TestDecimalHandling:
         row = map_transaction(payload, account_id="acc001", ingested_at="2026-06-12T10:00:00+00:00")
         assert Decimal(str(row["amount"])) > 0
 
+    def test_map_transaction_serialises_decimal_amount_in_raw_payload(self) -> None:
+        """The live TrueLayer client parses amounts as Decimal; json.dumps must handle it."""
+        payload = dict(SAMPLE_TXN)
+        payload["amount"] = Decimal("-12.50")
+        row = map_transaction(
+            payload, account_id="acc001", ingested_at="2026-06-12T10:00:00+00:00"
+        )
+        raw = json.loads(str(row["raw_payload"]))
+        assert raw["amount"] == "-12.50"
+
+    def test_map_account_serialises_decimal_values_in_raw_payload(self) -> None:
+        """Real account payloads may also contain Decimal values (e.g. nested balances)."""
+        payload = dict(SAMPLE_ACCOUNT)
+        payload["balance"] = Decimal("1234.56")
+        row = map_account(payload, now="2026-06-12T10:00:00+00:00")
+        raw = json.loads(str(row["raw_payload"]))
+        assert raw["balance"] == "1234.56"
+
 
 class TestContentDedupKey:
     def test_dedup_key_for_csv_source_uses_content_sha256_prefix(self) -> None:

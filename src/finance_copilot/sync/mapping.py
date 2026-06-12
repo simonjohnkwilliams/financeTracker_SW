@@ -45,7 +45,7 @@ def map_transaction(
         "transaction_type": payload["transaction_type"],
         "description": payload["description"],
         "provider_category": payload.get("transaction_category"),
-        "raw_payload": json.dumps(payload),
+        "raw_payload": json.dumps(payload, default=str),
         "ingested_at": ingested_at,
     }
 
@@ -76,7 +76,7 @@ def map_account(
         "currency": payload["currency"],
         "first_seen_at": now,
         "last_seen_at": now,
-        "raw_payload": json.dumps(payload),
+        "raw_payload": json.dumps(payload, default=str),
     }
 
 
