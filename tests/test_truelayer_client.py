@@ -29,7 +29,8 @@ def _ok_response(body: object) -> httpx.Response:
 
 
 def _error_response(status: int) -> httpx.Response:
-    return httpx.Response(status, json={"error": "test"})
+    request = httpx.Request("GET", "https://api.truelayer-sandbox.com/test")
+    return httpx.Response(status, json={"error": "test"}, request=request)
 
 
 SAMPLE_ACCOUNTS = [
@@ -61,8 +62,8 @@ class TestFetchAccounts:
         mock_client.get.return_value = _ok_response({"results": SAMPLE_ACCOUNTS})
         client = _make_client(mock_client)
         client.fetch_accounts()
-        call_kwargs = mock_client.get.call_args
-        assert f"Bearer {ACCESS_TOKEN}" in str(call_kwargs)
+        auth_header = mock_client.get.call_args.kwargs["headers"]["Authorization"]
+        assert auth_header == f"Bearer {ACCESS_TOKEN}"
 
     def test_fetch_accounts_returns_results_list(self) -> None:
         mock_client = MagicMock(spec=httpx.Client)
@@ -84,9 +85,8 @@ class TestFetchTransactions:
         mock_client.get.return_value = _ok_response({"results": SAMPLE_TXNS})
         client = _make_client(mock_client)
         client.fetch_transactions("acc001", from_date=date(2026, 3, 14))
-        call_kwargs = mock_client.get.call_args
-        # Check from param is present
-        assert "2026-03-14" in str(call_kwargs)
+        params = mock_client.get.call_args.kwargs.get("params") or {}
+        assert params.get("from") == "2026-03-14"
 
     def test_fetch_transactions_omits_from_when_none(self) -> None:
         mock_client = MagicMock(spec=httpx.Client)
@@ -165,7 +165,7 @@ class TestRetryLogic:
         client = _make_client(mock_client)
         with (
             patch("finance_copilot.truelayer.client.time.sleep") as mock_sleep,
-            pytest.raises(Exception),  # noqa: B017
+            pytest.raises(httpx.HTTPStatusError),
         ):
             client.fetch_accounts()
         # No retries for generic 4xx
@@ -178,3 +178,28 @@ class TestRetryLogic:
         client = _make_client(mock_client)
         with pytest.raises(AuthError):
             client.fetch_accounts()
+
+
+class TestPaginationDetection:
+    def test_fetch_transactions_logs_warning_when_next_key_present(self) -> None:
+        import structlog.testing
+
+        mock_client = MagicMock(spec=httpx.Client)
+        raw_body = b'{"results": [], "next": "/transactions?cursor=abc123"}'
+        mock_client.get.return_value = httpx.Response(200, content=raw_body)
+        client = _make_client(mock_client)
+        with structlog.testing.capture_logs() as logs:
+            client.fetch_transactions("acc001")
+        warning_logs = [e for e in logs if e.get("log_level") == "warning"]
+        assert any(e.get("event") == "pagination.detected" for e in warning_logs)
+
+    def test_fetch_transactions_no_warning_without_pagination(self) -> None:
+        import structlog.testing
+
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.get.return_value = _ok_response({"results": SAMPLE_TXNS})
+        client = _make_client(mock_client)
+        with structlog.testing.capture_logs() as logs:
+            client.fetch_transactions("acc001")
+        pagination_logs = [e for e in logs if e.get("event") == "pagination.detected"]
+        assert len(pagination_logs) == 0

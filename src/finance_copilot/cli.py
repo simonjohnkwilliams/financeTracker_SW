@@ -9,13 +9,23 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import secrets
 import sys
 import urllib.parse
+import webbrowser
+from datetime import date as date_type
 from typing import Any
 
+import httpx
+
 from finance_copilot.config import Settings
-from finance_copilot.sync.orchestrator import SyncOrchestrator
+from finance_copilot.db import check_schema_version, init_db, make_engine
+from finance_copilot.repositories.accounts import AccountRepository
+from finance_copilot.repositories.sync_runs import SyncRunRepository
+from finance_copilot.repositories.tokens import TokenRepository
+from finance_copilot.repositories.transactions import TransactionRepository
+from finance_copilot.sync.orchestrator import PROVIDER_TRUELAYER, SyncOrchestrator
 from finance_copilot.truelayer import oauth
 from finance_copilot.truelayer.errors import AuthError, TransientError
 
@@ -28,14 +38,6 @@ EXIT_UNEXPECTED = 99
 
 def _build_components(settings: Any) -> dict[str, Any]:
     """Construct all DB and repository components from settings."""
-    import httpx
-
-    from finance_copilot.db import check_schema_version, init_db, make_engine
-    from finance_copilot.repositories.accounts import AccountRepository
-    from finance_copilot.repositories.sync_runs import SyncRunRepository
-    from finance_copilot.repositories.tokens import TokenRepository
-    from finance_copilot.repositories.transactions import TransactionRepository
-
     engine = make_engine(str(settings.db_path))
     init_db(engine)
     check_schema_version(engine)
@@ -68,9 +70,6 @@ def _require_credentials(settings: Any) -> str | None:
 
 def cmd_auth(args: argparse.Namespace) -> int:
     """``finance auth`` — initiate OAuth consent and persist token."""
-    import contextlib
-    import webbrowser
-
     settings = Settings()
     error = _require_credentials(settings)
     if error:
@@ -130,7 +129,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
     )
 
     token_repo.put(
-        "truelayer",
+        PROVIDER_TRUELAYER,
         token_dict["access_token"],
         token_dict["refresh_token"],
         token_dict["expires_at"],
@@ -142,8 +141,6 @@ def cmd_auth(args: argparse.Namespace) -> int:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     """``finance sync`` — sync transactions from TrueLayer."""
-    from datetime import date as date_type
-
     settings = Settings()
     error = _require_credentials(settings)
     if error:
@@ -170,7 +167,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         api_host=settings.api_host,
         client_id=settings.truelayer_client_id,
         client_secret=settings.truelayer_client_secret,
-        redirect_uri=settings.truelayer_redirect_uri,
         http_client=components["http_client"],
     )
 

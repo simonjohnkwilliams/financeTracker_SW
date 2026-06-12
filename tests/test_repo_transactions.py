@@ -105,7 +105,7 @@ class TestBulkInsert:
         assert result.inserted == 2
         assert result.skipped_duplicate == 1
 
-    def test_bulk_insert_is_atomic_on_unexpected_error(
+    def test_bulk_insert_wraps_integrity_error_as_transaction_write_error(
         self, engine: Engine, repo: TransactionRepository
     ) -> None:
         _seed_account(engine)
@@ -113,11 +113,11 @@ class TestBulkInsert:
         rows = [_make_txn_row(dedup_key=f"tl:ok{i:03d}") for i in range(3)]
         bad_row = _make_txn_row(dedup_key="tl:bad999", account_id="no_such_account")
         all_rows = [*rows, bad_row]
-        from sqlalchemy.exc import IntegrityError
+        from finance_copilot.truelayer.errors import TransactionWriteError
 
-        with pytest.raises(IntegrityError):
+        with pytest.raises(TransactionWriteError):
             repo.bulk_insert(all_rows)
-        # Nothing should have been persisted
+        # Nothing should have been persisted (transaction rolled back)
         assert repo.count() == 0
 
     def test_bulk_insert_empty_list(self, repo: TransactionRepository) -> None:

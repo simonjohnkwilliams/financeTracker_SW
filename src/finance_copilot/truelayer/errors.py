@@ -29,3 +29,11 @@ class MappingError(FinanceCopilotError):
 
 class SchemaVersionError(FinanceCopilotError):
     """DB schema version is newer than the running code version."""
+
+
+class TransactionWriteError(FinanceCopilotError):
+    """Database write failure during transaction bulk insert.
+
+    Wraps SQLAlchemy ``IntegrityError`` to prevent raw row data from
+    appearing in log output (R15).
+    """

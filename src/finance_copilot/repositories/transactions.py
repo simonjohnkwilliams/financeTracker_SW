@@ -7,8 +7,10 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from finance_copilot.db import transactions_table
+from finance_copilot.truelayer.errors import TransactionWriteError
 
 
 @dataclass
@@ -30,25 +32,31 @@ class TransactionRepository:
 
         The insert is performed inside a single transaction so an unexpected
         integrity error (e.g. FK violation) rolls back the entire batch.
+        Any ``IntegrityError`` is wrapped as :exc:`TransactionWriteError` to
+        prevent raw row data from leaking into log output.
 
         Returns an :class:`InsertResult` with ``inserted`` and ``skipped_duplicate`` counts.
         """
         if not rows:
             return InsertResult(inserted=0, skipped_duplicate=0)
 
-        with self._engine.begin() as conn:
-            dedup_keys = [r["dedup_key"] for r in rows]
-            existing: set[str] = {
-                row[0]
-                for row in conn.execute(
-                    select(transactions_table.c.dedup_key).where(
-                        transactions_table.c.dedup_key.in_(dedup_keys)
+        new_rows: list[dict[str, Any]] = []
+        try:
+            with self._engine.begin() as conn:
+                dedup_keys = [r["dedup_key"] for r in rows]
+                existing: set[str] = {
+                    row[0]
+                    for row in conn.execute(
+                        select(transactions_table.c.dedup_key).where(
+                            transactions_table.c.dedup_key.in_(dedup_keys)
+                        )
                     )
-                )
-            }
-            new_rows = [r for r in rows if r["dedup_key"] not in existing]
-            if new_rows:
-                conn.execute(transactions_table.insert(), new_rows)
+                }
+                new_rows = [r for r in rows if r["dedup_key"] not in existing]
+                if new_rows:
+                    conn.execute(transactions_table.insert(), new_rows)
+        except IntegrityError as exc:
+            raise TransactionWriteError("Transaction write failed") from exc
 
         return InsertResult(
             inserted=len(new_rows),

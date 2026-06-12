@@ -8,7 +8,10 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
+from finance_copilot.log_config import get_logger
+from finance_copilot.ports import TrueLayerClientFactory, TrueLayerClientPort
 from finance_copilot.repositories.accounts import AccountRepository
 from finance_copilot.repositories.sync_runs import SyncRunRepository
 from finance_copilot.repositories.tokens import TokenRepository
@@ -16,7 +19,26 @@ from finance_copilot.repositories.transactions import TransactionRepository
 from finance_copilot.sync import incremental, mapping
 from finance_copilot.truelayer import oauth
 from finance_copilot.truelayer.client import TrueLayerClient
-from finance_copilot.truelayer.errors import AuthError, SyncBlockedError
+from finance_copilot.truelayer.errors import (
+    AuthError,
+    MappingError,
+    RateLimitError,
+    SyncBlockedError,
+    TransactionWriteError,
+    TransientError,
+)
+
+PROVIDER_TRUELAYER = "truelayer"
+
+log = get_logger("sync.orchestrator")
+
+_SYNC_ACCOUNT_ERRORS = (
+    RateLimitError,
+    TransientError,
+    MappingError,
+    TransactionWriteError,
+    SQLAlchemyError,
+)
 
 
 @dataclass
@@ -33,11 +55,7 @@ class SyncRunSummary:
 
 
 class SyncOrchestrator:
-    """Drives a single sync invocation from token check through to DB write.
-
-    The ``_tl_client_override`` constructor parameter is for testing only.
-    Pass an instance of a mock TrueLayerClient to bypass real HTTP.
-    """
+    """Drives a single sync invocation from token check through to DB write."""
 
     def __init__(
         self,
@@ -50,9 +68,8 @@ class SyncOrchestrator:
         api_host: str,
         client_id: str,
         client_secret: str,
-        redirect_uri: str,
         http_client: httpx.Client,
-        _tl_client_override: Any | None = None,
+        tl_client_factory: TrueLayerClientFactory | None = None,
     ) -> None:
         self._account_repo = account_repo
         self._transaction_repo = transaction_repo
@@ -62,9 +79,23 @@ class SyncOrchestrator:
         self._api_host = api_host
         self._client_id = client_id
         self._client_secret = client_secret
-        self._redirect_uri = redirect_uri
         self._http_client = http_client
-        self._tl_client_override = _tl_client_override
+        self._tl_client_factory: TrueLayerClientFactory = (
+            tl_client_factory if tl_client_factory is not None else self._make_default_factory()
+        )
+
+    def _make_default_factory(self) -> TrueLayerClientFactory:
+        api_host = self._api_host
+        http_client = self._http_client
+
+        def _create(*, access_token: str) -> TrueLayerClientPort:
+            return TrueLayerClient(
+                api_host=api_host,
+                access_token=access_token,
+                http_client=http_client,
+            )
+
+        return _create
 
     def run_one(self, *, explicit_from: date | None = None) -> SyncRunSummary:
         """Execute one sync run.
@@ -84,19 +115,18 @@ class SyncOrchestrator:
         - AuthError during token refresh → ``"failed"`` (exception re-raised)
         - All accounts failed → ``"failed"``
         """
-        # --- Concurrency guard ---
         if self._sync_run_repo.has_running_run():
             raise SyncBlockedError(
                 "A sync run is already in progress. Wait for it to complete or expire."
             )
 
         run_id = str(uuid.uuid4())
+        log.info("sync.start", run_id=run_id)
         self._sync_run_repo.open_run(run_id)
 
         try:
-            return self._execute(run_id, explicit_from=explicit_from)
+            result = self._execute(run_id, explicit_from=explicit_from)
         except AuthError:
-            # Close the run as failed before re-raising
             self._sync_run_repo.close_run(
                 run_id,
                 status="failed",
@@ -109,14 +139,19 @@ class SyncOrchestrator:
             )
             raise
 
+        log.info(
+            "sync.complete",
+            run_id=run_id,
+            status=result.status,
+            inserted=result.transactions_inserted,
+            skipped=result.transactions_skipped_duplicate,
+        )
+        return result
+
     def _execute(self, run_id: str, *, explicit_from: date | None) -> SyncRunSummary:
         """Orchestrate one sync: token refresh, fetch, write, close run."""
         access_token = self._ensure_fresh_token()
-        tl_client: Any = self._tl_client_override or TrueLayerClient(
-            api_host=self._api_host,
-            access_token=access_token,
-            http_client=self._http_client,
-        )
+        tl_client: TrueLayerClientPort = self._tl_client_factory(access_token=access_token)
 
         now_str = datetime.now(UTC).isoformat()
         account_payloads = tl_client.fetch_accounts()
@@ -156,8 +191,8 @@ class SyncOrchestrator:
 
         Raises ``AuthError`` if no token is stored or refresh is rejected.
         """
-        if self._token_repo.is_due_for_refresh("truelayer"):
-            token_row = self._token_repo.get("truelayer")
+        if self._token_repo.is_due_for_refresh(PROVIDER_TRUELAYER):
+            token_row = self._token_repo.get(PROVIDER_TRUELAYER)
             if token_row is None:
                 raise AuthError("No token stored — run `finance auth` first")
             new_token = oauth.refresh_token(
@@ -168,18 +203,18 @@ class SyncOrchestrator:
                 refresh_token_value=token_row["refresh_token"],
             )
             self._token_repo.put(
-                "truelayer",
+                PROVIDER_TRUELAYER,
                 new_token["access_token"],
                 new_token["refresh_token"],
                 new_token["expires_at"],
                 new_token["obtained_at"],
             )
-        token_row = self._token_repo.get("truelayer")
+        token_row = self._token_repo.get(PROVIDER_TRUELAYER)
         return token_row["access_token"] if token_row else ""
 
     def _sync_all_accounts(
         self,
-        tl_client: Any,
+        tl_client: TrueLayerClientPort,
         account_payloads: list[dict[str, Any]],
         *,
         explicit_from: date | None,
@@ -209,8 +244,15 @@ class SyncOrchestrator:
                 total_inserted += result.inserted
                 total_skipped += result.skipped_duplicate
                 accounts_succeeded += 1
-            except Exception as exc:
-                errors.append(f"{account_id}: {exc}")
+                log.debug(
+                    "account.sync",
+                    account_id=account_id,
+                    inserted=result.inserted,
+                    skipped=result.skipped_duplicate,
+                )
+            except _SYNC_ACCOUNT_ERRORS as exc:
+                log.warning("account.failed", account_id=account_id, error_type=type(exc).__name__)
+                errors.append(f"{account_id}: {type(exc).__name__}: {exc}")
 
         return total_inserted, total_skipped, accounts_succeeded, errors
 

@@ -7,15 +7,16 @@ All tests are offline (no real HTTP).
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog.testing
 
 from finance_copilot.repositories.tokens import TokenRepository
-from finance_copilot.sync.orchestrator import SyncOrchestrator
+from finance_copilot.sync.orchestrator import PROVIDER_TRUELAYER, SyncOrchestrator
 from finance_copilot.truelayer.errors import AuthError, SyncBlockedError, TransientError
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "spike_first_direct_sandbox.json"
@@ -26,8 +27,15 @@ def _load_fixture() -> dict[str, Any]:
     return data
 
 
+# Derived at import time so tests don't hard-code the count (TD-14)
+_FIXTURE_DATA = _load_fixture()
+TOTAL_TRANSACTIONS = sum(
+    len(v) for v in _FIXTURE_DATA["transactions_by_account"].values()
+)
+
+
 class MockTrueLayerClient:
-    """Mock TrueLayerClient backed by the sandbox fixture."""
+    """Mock TrueLayerClient backed by the sandbox fixture (satisfies TrueLayerClientPort)."""
 
     def __init__(
         self,
@@ -43,7 +51,9 @@ class MockTrueLayerClient:
     def fetch_accounts(self) -> list[dict[str, Any]]:
         return self._accounts
 
-    def fetch_transactions(self, account_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+    def fetch_transactions(
+        self, account_id: str, *, from_date: date | None = None
+    ) -> list[dict[str, Any]]:
         if self._fail_account_id and account_id == self._fail_account_id:
             raise TransientError(f"Simulated HTTP 500 for account {account_id}")
         return self._txns.get(account_id, [])
@@ -53,6 +63,9 @@ def _make_orchestrator(
     repos: dict[str, Any],
     tl_client: MockTrueLayerClient,
 ) -> SyncOrchestrator:
+    def factory(*, access_token: str) -> MockTrueLayerClient:
+        return tl_client
+
     return SyncOrchestrator(
         account_repo=repos["account_repo"],
         transaction_repo=repos["transaction_repo"],
@@ -62,9 +75,8 @@ def _make_orchestrator(
         api_host="https://api.truelayer-sandbox.com",
         client_id="test_client",
         client_secret="test_secret",
-        redirect_uri="http://localhost:8080/oauth2/callback",
         http_client=MagicMock(),
-        _tl_client_override=tl_client,
+        tl_client_factory=factory,  # type: ignore[arg-type]
     )
 
 
@@ -72,7 +84,9 @@ def _seed_fresh_token(token_repo: TokenRepository) -> None:
     """Insert a non-expired token into the token repo."""
     expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     obtained_at = datetime.now(UTC).isoformat()
-    token_repo.put("truelayer", "access_token_abc", "refresh_token_xyz", expires_at, obtained_at)
+    token_repo.put(
+        PROVIDER_TRUELAYER, "access_token_abc", "refresh_token_xyz", expires_at, obtained_at
+    )
 
 
 @pytest.fixture
@@ -101,8 +115,8 @@ class TestHappyPath:
         self, orchestrator: SyncOrchestrator, all_repos: dict[str, Any]
     ) -> None:
         result = orchestrator.run_one()
-        assert result.transactions_inserted == 2190
-        assert all_repos["transaction_repo"].count() == 2190
+        assert result.transactions_inserted == TOTAL_TRANSACTIONS
+        assert all_repos["transaction_repo"].count() == TOTAL_TRANSACTIONS
 
     def test_first_run_writes_sync_run_with_succeeded_status(
         self, orchestrator: SyncOrchestrator, all_repos: dict[str, Any]
@@ -135,7 +149,7 @@ class TestIdempotency:
         orchestrator.run_one()
         result = orchestrator.run_one()
         assert result.transactions_inserted == 0
-        assert result.transactions_skipped_duplicate == 2190
+        assert result.transactions_skipped_duplicate == TOTAL_TRANSACTIONS
 
     def test_second_run_with_one_new_transaction_inserts_exactly_one(
         self, all_repos: dict[str, Any], fixture_data: dict[str, Any]
@@ -173,7 +187,7 @@ class TestIdempotency:
         _seed_fresh_token(all_repos["token_repo"])
         result = orch2.run_one()
         assert result.transactions_inserted == 1
-        assert result.transactions_skipped_duplicate == 2190
+        assert result.transactions_skipped_duplicate == TOTAL_TRANSACTIONS
 
 
 class TestTokenLifecycle:
@@ -183,7 +197,11 @@ class TestTokenLifecycle:
         # Seed an almost-expired token (within REFRESH_SKEW_SECONDS)
         expires_at = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
         all_repos["token_repo"].put(
-            "truelayer", "old_access", "old_refresh", expires_at, datetime.now(UTC).isoformat()
+            PROVIDER_TRUELAYER,
+            "old_access",
+            "old_refresh",
+            expires_at,
+            datetime.now(UTC).isoformat(),
         )
 
         # Mock the oauth.refresh_token to return a fresh token
@@ -205,7 +223,7 @@ class TestTokenLifecycle:
 
         assert result.status == "succeeded"
         # Token should be updated
-        stored = all_repos["token_repo"].get("truelayer")
+        stored = all_repos["token_repo"].get(PROVIDER_TRUELAYER)
         assert stored is not None
         assert stored["access_token"] == "new_access"
 
@@ -215,7 +233,11 @@ class TestTokenLifecycle:
         # Seed an expired token
         expires_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
         all_repos["token_repo"].put(
-            "truelayer", "old_access", "old_refresh", expires_at, datetime.now(UTC).isoformat()
+            PROVIDER_TRUELAYER,
+            "old_access",
+            "old_refresh",
+            expires_at,
+            datetime.now(UTC).isoformat(),
         )
         client = MockTrueLayerClient(
             accounts=fixture_data["accounts"],
@@ -234,7 +256,11 @@ class TestTokenLifecycle:
     ) -> None:
         expires_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
         all_repos["token_repo"].put(
-            "truelayer", "old_access", "old_refresh", expires_at, datetime.now(UTC).isoformat()
+            PROVIDER_TRUELAYER,
+            "old_access",
+            "old_refresh",
+            expires_at,
+            datetime.now(UTC).isoformat(),
         )
         client = MockTrueLayerClient(
             accounts=fixture_data["accounts"],
@@ -332,13 +358,13 @@ class TestIncrementalWindow:
     def test_explicit_from_override_is_propagated_to_client(
         self, all_repos: dict[str, Any], fixture_data: dict[str, Any]
     ) -> None:
-        from datetime import date
-
         fetch_calls: list[dict[str, Any]] = []
 
         class RecordingClient(MockTrueLayerClient):
-            def fetch_transactions(self, account_id: str, **kwargs: Any) -> list[dict[str, Any]]:
-                fetch_calls.append({"account_id": account_id, "kwargs": kwargs})
+            def fetch_transactions(
+                self, account_id: str, *, from_date: date | None = None
+            ) -> list[dict[str, Any]]:
+                fetch_calls.append({"account_id": account_id, "kwargs": {"from_date": from_date}})
                 return []
 
         client = RecordingClient(
@@ -407,3 +433,41 @@ class TestThirdRunRecovery:
         assert result.status == "succeeded"
         # Count should be unchanged (dedup)
         assert all_repos["transaction_repo"].count() == count_after_first
+
+
+class TestStructuredLogging:
+    def test_run_one_emits_sync_start_log(
+        self, orchestrator: SyncOrchestrator
+    ) -> None:
+        with structlog.testing.capture_logs() as logs:
+            orchestrator.run_one()
+        start_logs = [e for e in logs if e.get("event") == "sync.start"]
+        assert len(start_logs) == 1
+        assert "run_id" in start_logs[0]
+
+    def test_run_one_emits_sync_complete_log_on_success(
+        self, orchestrator: SyncOrchestrator
+    ) -> None:
+        with structlog.testing.capture_logs() as logs:
+            orchestrator.run_one()
+        complete_logs = [e for e in logs if e.get("event") == "sync.complete"]
+        assert len(complete_logs) == 1
+        assert complete_logs[0]["status"] == "succeeded"
+        assert "inserted" in complete_logs[0]
+
+    def test_account_failure_emits_account_failed_warning(
+        self, all_repos: dict[str, Any], fixture_data: dict[str, Any]
+    ) -> None:
+        fail_id = fixture_data["accounts"][0]["account_id"]
+        client = MockTrueLayerClient(
+            accounts=fixture_data["accounts"],
+            txns_by_account=fixture_data["transactions_by_account"],
+            fail_account_id=fail_id,
+        )
+        orch = _make_orchestrator(all_repos, client)
+        _seed_fresh_token(all_repos["token_repo"])
+        with structlog.testing.capture_logs() as logs:
+            orch.run_one()
+        failed_logs = [e for e in logs if e.get("event") == "account.failed"]
+        assert len(failed_logs) == 1
+        assert failed_logs[0]["account_id"] == fail_id

@@ -10,7 +10,10 @@ from typing import Any
 
 import httpx
 
+from finance_copilot.log_config import get_logger
 from finance_copilot.truelayer.errors import AuthError, RateLimitError, TransientError
+
+log = get_logger("truelayer.client")
 
 SANDBOX_API_HOST = "https://api.truelayer-sandbox.com"
 LIVE_API_HOST = "https://api.truelayer.com"
@@ -61,6 +64,13 @@ class TrueLayerClient:
             f"{self._api_host}/data/v1/accounts/{account_id}/transactions",
             params=params if params else None,
         )
+        if "next" in body or "cursor" in body:
+            log.warning(
+                "pagination.detected",
+                account_id=account_id,
+                has_next="next" in body,
+                has_cursor="cursor" in body,
+            )
         return list(body.get("results", []))
 
     def _get(
