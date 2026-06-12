@@ -27,9 +27,10 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 @pytest.fixture(scope="module")
 def sandbox_fixture() -> dict[str, Any]:
-    return json.loads(
+    data: dict[str, Any] = json.loads(
         (FIXTURES_DIR / "spike_first_direct_sandbox.json").read_text(encoding="utf-8")
     )
+    return data
 
 
 @pytest.fixture
@@ -50,7 +51,12 @@ def _build_mock_client(fixture: dict[str, Any]) -> MagicMock:
 
     mock_client = MagicMock()
     mock_client.post.return_value = _ok_response(
-        {"access_token": "test-AT", "refresh_token": "test-RT", "expires_in": 3600, "token_type": "Bearer"}
+        {
+            "access_token": "test-AT",
+            "refresh_token": "test-RT",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }
     )
 
     def mock_get(url: str, **kwargs: Any) -> MagicMock:
@@ -74,9 +80,11 @@ def _make_ctx(mock_client: MagicMock) -> MagicMock:
 
 def _run_with_mocks(config: Config, fixture: dict[str, Any], output_dir: Path) -> Path:
     mock_client = _build_mock_client(fixture)
-    with patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"):
-        with patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)):
-            return run(config=config, output_dir=output_dir, open_browser=False)
+    with (
+        patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"),
+        patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)),
+    ):
+        return run(config=config, output_dir=output_dir, open_browser=False)
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +204,11 @@ def test_e2e_run_posts_auth_code_to_token_endpoint(
     sandbox_fixture: dict[str, Any], sandbox_config: Config, tmp_path: Path
 ) -> None:
     mock_client = _build_mock_client(sandbox_fixture)
-    with patch("spike_first_direct.wait_for_authorisation_code", return_value="the-code-xyz"):
-        with patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)):
-            run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
+    with (
+        patch("spike_first_direct.wait_for_authorisation_code", return_value="the-code-xyz"),
+        patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)),
+    ):
+        run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
 
     args, kwargs = mock_client.post.call_args
     assert args[0] == f"{SANDBOX_AUTH_HOST}/connect/token"
@@ -211,9 +221,11 @@ def test_e2e_run_fetches_transactions_for_all_accounts(
     sandbox_fixture: dict[str, Any], sandbox_config: Config, tmp_path: Path
 ) -> None:
     mock_client = _build_mock_client(sandbox_fixture)
-    with patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"):
-        with patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)):
-            run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
+    with (
+        patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"),
+        patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)),
+    ):
+        run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
 
     get_urls = [call.args[0] for call in mock_client.get.call_args_list]
     for acc in sandbox_fixture["accounts"]:
@@ -225,9 +237,11 @@ def test_e2e_run_sends_bearer_token_on_all_data_requests(
     sandbox_fixture: dict[str, Any], sandbox_config: Config, tmp_path: Path
 ) -> None:
     mock_client = _build_mock_client(sandbox_fixture)
-    with patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"):
-        with patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)):
-            run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
+    with (
+        patch("spike_first_direct.wait_for_authorisation_code", return_value="auth-code"),
+        patch("spike_first_direct.httpx.Client", return_value=_make_ctx(mock_client)),
+    ):
+        run(config=sandbox_config, output_dir=tmp_path, open_browser=False)
 
     for call in mock_client.get.call_args_list:
         _, kwargs = call
