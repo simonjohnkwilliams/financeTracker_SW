@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
 from spike_first_direct import (
     DEFAULT_REDIRECT_URI,
     DEFAULT_SCOPES,
