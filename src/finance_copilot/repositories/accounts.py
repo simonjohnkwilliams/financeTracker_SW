@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import Engine
 
@@ -41,9 +41,6 @@ class AccountRepository:
 
     def count(self) -> int:
         """Return the total number of accounts stored."""
-        from sqlalchemy import func
-        from sqlalchemy import select as sa_select
-
         with self._engine.connect() as conn:
-            result = conn.execute(sa_select(func.count()).select_from(accounts_table))
+            result = conn.execute(select(func.count()).select_from(accounts_table))
             return int(result.scalar() or 0)

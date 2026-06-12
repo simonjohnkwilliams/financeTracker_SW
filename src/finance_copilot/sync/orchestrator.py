@@ -110,10 +110,52 @@ class SyncOrchestrator:
             raise
 
     def _execute(self, run_id: str, *, explicit_from: date | None) -> SyncRunSummary:
-        """Inner execution — token refresh, account/txn fetch, DB writes."""
-        now_str = datetime.now(UTC).isoformat()
+        """Orchestrate one sync: token refresh, fetch, write, close run."""
+        access_token = self._ensure_fresh_token()
+        tl_client: Any = self._tl_client_override or TrueLayerClient(
+            api_host=self._api_host,
+            access_token=access_token,
+            http_client=self._http_client,
+        )
 
-        # --- Token management ---
+        now_str = datetime.now(UTC).isoformat()
+        account_payloads = tl_client.fetch_accounts()
+        for payload in account_payloads:
+            self._account_repo.upsert(mapping.map_account(payload, now=now_str))
+
+        total_inserted, total_skipped, accounts_succeeded, errors = self._sync_all_accounts(
+            tl_client, account_payloads, explicit_from=explicit_from
+        )
+
+        accounts_attempted = len(account_payloads)
+        status = _derive_status(accounts_attempted, accounts_succeeded)
+        error_summary: str | None = "; ".join(errors) if errors else None
+
+        self._sync_run_repo.close_run(
+            run_id,
+            status=status,
+            finished_at=datetime.now(UTC).isoformat(),
+            accounts_attempted=accounts_attempted,
+            accounts_succeeded=accounts_succeeded,
+            transactions_inserted=total_inserted,
+            transactions_skipped_duplicate=total_skipped,
+            error_summary=error_summary,
+        )
+        return SyncRunSummary(
+            run_id=run_id,
+            status=status,
+            accounts_attempted=accounts_attempted,
+            accounts_succeeded=accounts_succeeded,
+            transactions_inserted=total_inserted,
+            transactions_skipped_duplicate=total_skipped,
+            error_summary=error_summary,
+        )
+
+    def _ensure_fresh_token(self) -> str:
+        """Refresh the TrueLayer token if near-expiry and return the access token.
+
+        Raises ``AuthError`` if no token is stored or refresh is rejected.
+        """
         if self._token_repo.is_due_for_refresh("truelayer"):
             token_row = self._token_repo.get("truelayer")
             if token_row is None:
@@ -132,49 +174,32 @@ class SyncOrchestrator:
                 new_token["expires_at"],
                 new_token["obtained_at"],
             )
-
         token_row = self._token_repo.get("truelayer")
-        access_token: str = token_row["access_token"] if token_row else ""
+        return token_row["access_token"] if token_row else ""
 
-        # Build (or use override) TrueLayerClient
-        tl_client: Any
-        if self._tl_client_override is not None:
-            tl_client = self._tl_client_override
-        else:
-            tl_client = TrueLayerClient(
-                api_host=self._api_host,
-                access_token=access_token,
-                http_client=self._http_client,
-            )
+    def _sync_all_accounts(
+        self,
+        tl_client: Any,
+        account_payloads: list[dict[str, Any]],
+        *,
+        explicit_from: date | None,
+    ) -> tuple[int, int, int, list[str]]:
+        """Sync transactions for every account; isolate per-account failures.
 
-        # --- Fetch accounts ---
-        account_payloads = tl_client.fetch_accounts()
-        now_str = datetime.now(UTC).isoformat()
-        for payload in account_payloads:
-            row = mapping.map_account(payload, now=now_str)
-            self._account_repo.upsert(row)
-
-        # --- Per-account transaction sync ---
+        Returns ``(total_inserted, total_skipped, accounts_succeeded, error_messages)``.
+        """
         total_inserted = 0
         total_skipped = 0
         accounts_succeeded = 0
-        failed_account_ids: list[str] = []
+        errors: list[str] = []
 
         for payload in account_payloads:
-            account_id: str = str(payload.get("account_id", ""))
+            account_id = str(payload.get("account_id", ""))
             try:
-                last_booking_date_str = self._transaction_repo.max_booking_date(account_id)
-                from datetime import date as date_type
-
-                last_booking: date_type | None = None
-                if last_booking_date_str:
-                    last_booking = date_type.fromisoformat(last_booking_date_str)
-
+                last_str = self._transaction_repo.max_booking_date(account_id)
+                last_booking: date | None = date.fromisoformat(last_str) if last_str else None
                 from_date = incremental.sync_from_date(last_booking, explicit_from=explicit_from)
-
-                txn_payloads = tl_client.fetch_transactions(
-                    account_id, from_date=from_date
-                )
+                txn_payloads = tl_client.fetch_transactions(account_id, from_date=from_date)
                 ingested_at = datetime.now(UTC).isoformat()
                 rows = [
                     mapping.map_transaction(t, account_id=account_id, ingested_at=ingested_at)
@@ -184,41 +209,16 @@ class SyncOrchestrator:
                 total_inserted += result.inserted
                 total_skipped += result.skipped_duplicate
                 accounts_succeeded += 1
-
             except Exception as exc:
-                failed_account_ids.append(f"{account_id}: {exc}")
+                errors.append(f"{account_id}: {exc}")
 
-        # --- Determine status ---
-        accounts_attempted = len(account_payloads)
-        if accounts_succeeded == accounts_attempted:
-            status = "succeeded"
-        elif accounts_succeeded == 0:
-            status = "failed"
-        else:
-            status = "partial"
+        return total_inserted, total_skipped, accounts_succeeded, errors
 
-        error_summary: str | None = None
-        if failed_account_ids:
-            error_summary = "; ".join(failed_account_ids)
 
-        # --- Close sync_run ---
-        self._sync_run_repo.close_run(
-            run_id,
-            status=status,
-            finished_at=datetime.now(UTC).isoformat(),
-            accounts_attempted=accounts_attempted,
-            accounts_succeeded=accounts_succeeded,
-            transactions_inserted=total_inserted,
-            transactions_skipped_duplicate=total_skipped,
-            error_summary=error_summary,
-        )
-
-        return SyncRunSummary(
-            run_id=run_id,
-            status=status,
-            accounts_attempted=accounts_attempted,
-            accounts_succeeded=accounts_succeeded,
-            transactions_inserted=total_inserted,
-            transactions_skipped_duplicate=total_skipped,
-            error_summary=error_summary,
-        )
+def _derive_status(accounts_attempted: int, accounts_succeeded: int) -> str:
+    """Map attempt/success counts to a sync_run status string."""
+    if accounts_succeeded == accounts_attempted:
+        return "succeeded"
+    if accounts_succeeded == 0:
+        return "failed"
+    return "partial"
