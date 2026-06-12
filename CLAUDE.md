@@ -6,8 +6,6 @@ Personal finance + landlord/tax reporting proof-of-concept. Ingests Open Banking
 transaction data via TrueLayer AIS, stores it in a local SQLite database, and
 will eventually provide AI-assisted categorisation and tax-year summaries.
 
-Owner: Simon Williams (`s.williams@sportradar.com`)
-
 ---
 
 ## Current milestone
@@ -142,14 +140,49 @@ TRUELAYER_PROVIDERS=...         # optional, overrides sandbox default
 | Money representation | `Decimal` (parsed at API boundary) | Avoids float rounding; `parse_float=Decimal` in JSON loads from M3 |
 | `account_number` handling | `raw_payload` only | Sensitive; no normalised column |
 
+## Engineering Principles
+
+* Follow SOLID principles.
+* Prefer simple, explicit solutions.
+* Separate orchestration, persistence and integration concerns.
+* Prefer composition over inheritance.
+* Single responsibility per class.
+* Maximum class size: 500 lines.
+* Maximum method size: 50 lines.
+* Build only the currently approved phase.
+* Code should be maintainable by a senior Java developer.
+* Prefer explicit domain models over dictionaries and untyped structures.
+
 ---
 
 ## Phase 1 planned scope (not yet implemented)
 
-- SQLite schema: `accounts`, `transactions`, `sync_runs` tables
-- Repository abstraction: `AccountRepository`, `TransactionRepository`
-- TrueLayer ingestion pipeline wired to database
-- Basic CLI: `finance sync`
-- mypy strict + ruff clean across `src/`
+Current phase and scope are defined by the approved architecture document for the active milestone.
 
-Do not scaffold Phase 1 until sign-off is given in the conversation.
+## Review Process
+
+Major implementation phases must be reviewed against:
+
+* Architecture documents
+* Acceptance criteria
+* Engineering principles
+
+Review outcomes:
+
+* PASS
+* PASS WITH RECOMMENDATIONS
+* FAIL
+
+Implementation is not complete until review passes.
+
+## Definition of Done
+
+A phase is complete when:
+
+* Acceptance criteria pass.
+* Tests pass.
+* Ruff passes.
+* Mypy passes.
+* Documentation is updated.
+* Architecture remains compliant.
+* No critical findings remain from architecture review.
