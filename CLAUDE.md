@@ -12,16 +12,26 @@ Owner: Simon Williams (`s.williams@sportradar.com`)
 
 ## Current milestone
 
-**Phase 1 complete** (as of 2026-06-12):
+**Phase 1 fully signed off** (2026-06-12) — PASS (unqualified):
 
 - SQLite schema: `accounts`, `transactions`, `sync_runs`, `oauth_tokens`, `schema_version` tables.
 - Repository pattern: `AccountRepository`, `TransactionRepository`, `SyncRunRepository`, `TokenRepository`.
-- TrueLayer ingestion pipeline: OAuth PKCE flow, token refresh, incremental sync with dedup.
+- Domain models: `Account`, `Transaction` frozen dataclasses in `src/finance_copilot/models/`.
+- Ports: `TrueLayerClientPort`, `TrueLayerClientFactory`, repository Protocols in `src/finance_copilot/ports.py`.
+- TrueLayer ingestion pipeline: OAuth PKCE flow, token refresh, incremental sync with dedup, pagination warning.
+- Structured logging via structlog: `sync.start`, `sync.complete`, `account.failed`, `pagination.detected`.
 - CLI: `finance auth`, `finance sync`, `finance status`.
-- 148 tests green (36 Phase-0 + 112 Phase-1). mypy strict + ruff clean.
+- 174 tests green. mypy strict + ruff clean.
+- Gates passed: G2 (sandbox smoke) + G3 (live First Direct smoke).
 
-**Phase 2 not yet started.** Do not implement beyond Phase 1 scope without
-explicit sign-off on the next milestone.
+**Phase 2 in design — Multi-provider sync** (NatWest + Amex alongside First Direct).
+See `docs/phase-2-architecture.md` for the full spec (schema, components, TDD
+ordering, acceptance criteria). Implementation has not yet started; this
+document is the contract for the implementing model.
+
+**Do not implement beyond Phase 2 scope** as defined in
+`docs/phase-2-architecture.md`. If you find an ambiguity not covered there,
+STOP and surface it to the user — do not invent a design decision.
 
 ---
 
@@ -104,21 +114,27 @@ src/finance_copilot/        # application package
   config.py                 # pydantic-settings: env + DB path
   log_config.py             # structlog config + sensitive-field redaction
   db.py                     # SQLAlchemy Core metadata, engine factory, init_db
-  models/                   # (reserved for future typed models)
+  ports.py                  # Protocol types (TrueLayerClientPort, TrueLayerClientFactory, repo ports)
+  models/
+    account.py              # Account frozen dataclass
+    transaction.py          # Transaction frozen dataclass
   repositories/
     accounts.py             # AccountRepository
-    transactions.py         # TransactionRepository (dedup-aware bulk_insert)
+    transactions.py         # TransactionRepository (dedup-aware bulk_insert; wraps IntegrityError)
     sync_runs.py            # SyncRunRepository
-    tokens.py               # TokenRepository (single-row per provider)
+    tokens.py               # TokenRepository (Phase 1: keyed by provider; Phase 2: by connection_id)
   truelayer/
-    errors.py               # AuthError, RateLimitError, TransientError, …
+    errors.py               # AuthError, RateLimitError, TransientError, TransactionWriteError, …
     oauth.py                # PKCE helpers, exchange_code, refresh_token
-    client.py               # TrueLayerClient with retry
+    client.py               # TrueLayerClient with retry + pagination.detected warning
   sync/
     incremental.py          # sync_from_date() — pure window calculation
-    mapping.py              # TrueLayer payload → DB row dict
-    orchestrator.py         # SyncOrchestrator.run_one()
+    mapping.py              # TrueLayer payload → DB row dict (Decimal-safe via default=str)
+    orchestrator.py         # SyncOrchestrator with structured logging + factory injection
   cli.py                    # finance auth | sync | status
+scripts/
+  spike_first_direct.py     # canonical Phase-0 spike (also copied to tests/)
+  spot_check.py             # operational helper — prints 10 most recent transactions
 
 tests/
   conftest.py               # shared fixtures (in-memory engine, fixture data)
@@ -228,7 +244,24 @@ TRUELAYER_PROVIDERS=...         # optional, overrides sandbox default
 
 ---
 
-## Phase 2 planned scope (not yet implemented)
+## Phase 2 — Multi-provider sync (designed, awaiting implementation)
 
-TBD — to be drafted after Phase 1 smoke-test sign-off (Gate 2 + Gate 3 from
-`docs/phase-1-architecture.md`).
+**Scope:** Extend the TrueLayer pipeline to support multiple PSD2 consents
+in parallel — First Direct + NatWest (live), Amex UK (public beta) — with
+a `connections` parent table, creds-driven auth loop, per-connection
+sync runs, and auto-reauth mid-sync when refresh tokens expire.
+
+**Full spec:** `docs/phase-2-architecture.md` (locked decisions, schema,
+v1→v2 migration plan, component signatures, TDD ordering, 24 ACs).
+
+**Key Phase 2 invariants** (lifted into CLAUDE.md so they aren't lost):
+
+- Schema bumps to v2; migration preserves the existing First Direct connection.
+- A rolling backup is written before every `finance sync` AND every migration:
+  `finance.db.bak-YYYYMMDD-HHMMSS`, retention = 5 most recent, older deleted.
+- `oauth_tokens.connection_id` is the new PK; `accounts.connection_id` is FK.
+- `AuthService` (new) owns the OAuth flow and is invoked from both CLI and orchestrator.
+- `SyncOrchestrator.run_one` is now per-connection; `MultiConnectionSyncer` iterates.
+- `TRUELAYER_BANKS` in `creds` lists the provider_account values to connect.
+
+Phase 3 (categorisation, reporting) is deferred until Phase 2 is fully signed off.

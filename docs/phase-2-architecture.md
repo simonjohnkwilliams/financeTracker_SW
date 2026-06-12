@@ -46,6 +46,7 @@ Sonnet does not need to make design decisions during implementation.
 | Schema migration v1 → v2 | Existing First Direct connection preserved; no data loss |
 | Per-connection observability | Structured logs include `connection_id` and `provider_account`; `finance status` shows per-connection state |
 | 90-day expiry tracking | `connections.expires_at`; logged warning at <14 days remaining |
+| Rolling DB backups | `finance.db.bak-<ts>` written before every sync and migration; rolling retention of 5 |
 
 ## 2. Out of scope (deferred — do not let these creep in)
 
@@ -173,6 +174,7 @@ Phase 1 left databases at `schema_version=1` with one `oauth_tokens` row (`provi
 ### Algorithm (executed once when `init_db` detects `schema_version=1`)
 
 ```
+0. create_backup(db_path)  -- writes finance.db.bak-YYYYMMDD-HHMMSS, rotates to 5
 1. Begin transaction.
 2. CREATE TABLE connections (...).
 3. CREATE TABLE oauth_tokens_v2 (...).
@@ -222,9 +224,54 @@ def _display_name_for(provider_account: str) -> str:
     return _DISPLAY_NAMES.get(provider_account, provider_account)
 ```
 
-### Backup before migration
+### Backup policy (applies to all write paths, not just migrations)
 
-`init_db` must copy the DB file to `finance.db.v1.bak` before executing the migration. If migration raises, the original DB is intact. This is a CYA measure since SQLite schema migrations are non-trivial.
+Before any operation that materially mutates the database — schema
+migration OR `finance sync` invocation — the implementation writes a
+snapshot copy of `finance.db` next to the original:
+
+```
+finance.db.bak-YYYYMMDD-HHMMSS
+```
+
+A rolling retention policy keeps only the **5 most recent** backups.
+Older backups are deleted automatically after each successful backup
+write. The retention scan matches only the `<db_name>.bak-*` filename
+pattern in the same directory; backups of other databases are not
+touched.
+
+A single helper module owns the policy:
+
+```python
+# src/finance_copilot/backup.py
+RETENTION_COUNT = 5
+
+def create_backup(db_path: Path) -> Path | None:
+    """Snapshot db_path to db_path.bak-YYYYMMDD-HHMMSS; rotate retention.
+
+    Returns the path of the new backup file, or None if db_path does
+    not exist (e.g. fresh project before any sync). Idempotent if
+    called twice in the same second (timestamp suffix may collide —
+    the helper appends a uniqueness counter if needed).
+    """
+
+def list_backups(db_path: Path) -> list[Path]:
+    """All backup files for db_path, newest first."""
+
+def rotate_backups(db_path: Path) -> list[Path]:
+    """Delete all but the RETENTION_COUNT most recent backups.
+    Returns the list of deleted Paths."""
+```
+
+The backup helper is invoked from:
+
+- `cli.cmd_sync` — once, before the orchestrator runs (covers all
+  connections in a single invocation).
+- `db.init_db` — once, before any v1→v2 migration steps execute.
+
+If `create_backup` itself raises (disk full, permissions denied), the
+sync/migration aborts before touching the DB. This is intentional: no
+backup → no write.
 
 ### Migration tests
 
@@ -485,6 +532,45 @@ class AuthServicePort(Protocol):
 
 Update `TokenRepositoryPort` and `AccountRepositoryPort` signatures to match the modified implementations.
 
+### 6.10 Backup helper (new)
+
+`src/finance_copilot/backup.py`
+
+```python
+from pathlib import Path
+from datetime import datetime, UTC
+import shutil
+
+RETENTION_COUNT = 5
+_TS_FMT = "%Y%m%d-%H%M%S"
+
+
+def create_backup(db_path: Path) -> Path | None:
+    """Snapshot db_path to <db_path>.bak-YYYYMMDD-HHMMSS, then rotate.
+
+    Returns the new backup Path. Returns None if db_path does not exist
+    (e.g. first ever invocation on a fresh project).
+    """
+
+
+def list_backups(db_path: Path) -> list[Path]:
+    """All backup files matching <db_path.name>.bak-* in db_path.parent,
+    sorted newest first by timestamp suffix."""
+
+
+def rotate_backups(db_path: Path) -> list[Path]:
+    """Delete every backup beyond the RETENTION_COUNT most recent.
+    Returns the list of deleted Paths."""
+```
+
+Invariants:
+
+- `create_backup` MUST call `rotate_backups` after the copy succeeds.
+- `list_backups` MUST sort by timestamp suffix, not by filesystem mtime
+  (mtime is unreliable on Windows when copies happen rapidly).
+- Backups MUST live in the same directory as `db_path` so a user can
+  inspect/restore them without hunting.
+
 ---
 
 ## 7. Data flow
@@ -636,6 +722,7 @@ Each layer = `tests/<file>` written first, then `src/finance_copilot/<file>` to 
 | `tests/test_settings_banks.py` | `src/finance_copilot/config.py` | `Settings.banks` parses comma/space-separated string into a list |
 | `tests/test_mapping_with_connection.py` | `src/finance_copilot/sync/mapping.py` | `map_account` now accepts and emits `connection_id` |
 | `tests/test_display_name_lookup.py` | (small module — co-located with migration) | `_display_name_for` returns mapped names + fallback |
+| `tests/test_backup.py` | `src/finance_copilot/backup.py` | `create_backup` writes timestamped file; `list_backups` sorts newest-first; `rotate_backups` keeps exactly RETENTION_COUNT; `create_backup` returns None when db_path missing |
 
 ### Layer 1 — Schema, migration, repositories
 
@@ -696,7 +783,9 @@ Each AC must have at least one corresponding automated test. Manual gates (G2, G
 | AC1 | `Settings.banks` correctly parses comma- and space-separated `TRUELAYER_BANKS` strings into a `list[str]` |
 | AC2 | The `connections` table exists in v2 schema with all columns specified in §4 |
 | AC3 | v1→v2 migration creates exactly one synthetic connection per existing oauth_tokens row, preserving all accounts and transactions |
-| AC4 | v1→v2 migration writes a backup file `finance.db.v1.bak` before altering the DB |
+| AC4 | A backup file `finance.db.bak-YYYYMMDD-HHMMSS` is written before each v1→v2 migration AND before each `finance sync` invocation |
+| AC4a | `rotate_backups` retains exactly the 5 most recent backups for a given DB path; older backups are deleted after each new backup write |
+| AC4b | `create_backup` returns `None` (no error raised) when invoked on a non-existent DB path (fresh-project case) |
 | AC5 | `ConnectionRepository.add` raises if a duplicate `(provider, provider_account)` active row exists |
 | AC6 | `TokenRepository.put/get/is_due_for_refresh` all operate on `connection_id`, not provider strings |
 | AC7 | `AuthService.connect(provider_account='X')` is a no-op if an active connection for X exists and `force=False` |
@@ -724,7 +813,7 @@ Each AC must have at least one corresponding automated test. Manual gates (G2, G
 
 | Gate | Owner | Done when |
 |---|---|---|
-| G1: schema + migration smoke | Implementer | Run `uv run finance status` on the existing First Direct DB after the migration code lands; existing 5 accounts + 2190 transactions still visible; one connection in the `connections` table |
+| G1: schema + migration smoke | Implementer | Run `uv run finance status` on the existing First Direct DB after the migration code lands; existing 5 accounts + 2190 transactions still visible; one connection in the `connections` table; verify a `finance.db.bak-<ts>` file was written next to the original DB |
 | G2: dual-provider sandbox smoke | Implementer | Add a second mock provider to `TRUELAYER_BANKS`, run `finance auth` (two browser flows), `finance sync`; two `sync_runs` rows, accounts from two distinct `provider_account`s |
 | G3: dual-provider live smoke (First Direct + NatWest) | User | After implementation: live consent for both banks; `finance sync` populates both; spot-check 5 NatWest transactions against the NatWest app |
 | G4: auto-reauth smoke | User | Manually invalidate a refresh token (delete the row in `oauth_tokens` and revert connection.status to `revoked`, OR wait for natural 90-day expiry); run `finance sync`; browser opens for re-auth; sync resumes successfully |
