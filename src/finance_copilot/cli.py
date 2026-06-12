@@ -50,12 +50,33 @@ def _build_components(settings: Any) -> dict[str, Any]:
     }
 
 
+def _require_credentials(settings: Any) -> str | None:
+    """Return an error message if TrueLayer credentials are missing, else None."""
+    missing: list[str] = []
+    if not settings.truelayer_client_id:
+        missing.append("TRUELAYER_CLIENT_ID")
+    if not settings.truelayer_client_secret:
+        missing.append("TRUELAYER_CLIENT_SECRET")
+    if missing:
+        return (
+            f"Missing TrueLayer credentials: {', '.join(missing)}. "
+            f"Set these in a `creds` or `.env` file in the project root, "
+            f"or export them as environment variables."
+        )
+    return None
+
+
 def cmd_auth(args: argparse.Namespace) -> int:
     """``finance auth`` — initiate OAuth consent and persist token."""
     import contextlib
     import webbrowser
 
     settings = Settings()
+    error = _require_credentials(settings)
+    if error:
+        print(error, file=sys.stderr)
+        return EXIT_VALIDATION
+
     components = _build_components(settings)
     token_repo = components["token_repo"]
     http_client = components["http_client"]
@@ -124,6 +145,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
     from datetime import date as date_type
 
     settings = Settings()
+    error = _require_credentials(settings)
+    if error:
+        print(error, file=sys.stderr)
+        return EXIT_VALIDATION
+
     components = _build_components(settings)
 
     explicit_from: date_type | None = None
